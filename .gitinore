@@ -1,0 +1,7 @@
+.env
+btc_last_sent.txt
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env.*
