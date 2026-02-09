@@ -1,4 +1,16 @@
-# bot.py — Capital livre = capital fora de trade (wallet - margens usadas)
+# bot.py — ENGLISH COMMANDS (attractive) + auto-delete + /pnl shows open assets + live price
+# Commands:
+#   /wallet   -> menu (Free Balance / In-Trade / Open Positions)
+#   /pnl      -> Month-to-date PnL (includes open trades) + shows your open assets + current price
+#   /ids      -> shows user_id + chat_id (auto-delete 5s)
+#   /commands -> list commands (auto-delete 8s)
+#
+# Aliases (old PT commands still work):
+#   /saldo -> /wallet
+#   /mensal -> /pnl
+#   /id -> /ids
+#   /comandos -> /commands
+
 import os
 import time
 import hmac
@@ -12,7 +24,7 @@ from pathlib import Path
 
 import requests
 
-# --- Carregar .env ---
+# --- Load .env ---
 try:
     from dotenv import load_dotenv
     env_path = Path(__file__).resolve().parent / ".env"
@@ -25,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 # -------------------- ENV --------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # se definido, limita /saldo a este chat
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # if set, limit commands to this chat
 
 BYBIT_TESTNET = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
 BYBIT_BASE_URL = "https://api-testnet.bybit.com" if BYBIT_TESTNET else "https://api.bybit.com"
@@ -33,21 +45,31 @@ BYBIT_BASE_URL = "https://api-testnet.bybit.com" if BYBIT_TESTNET else "https://
 BTC_ALERT_SECONDS = int(os.getenv("BTC_ALERT_SECONDS", "2700"))  # 45 min
 AUTO_DELETE_SECONDS = int(os.getenv("AUTO_DELETE_SECONDS", "5"))
 
-# -------------------- Estado --------------------
-telegram_update_offset = None
+# Auto-delete timers
+COMMANDS_DELETE_SECONDS = 8
+PNL_DELETE_SECONDS = 7
+IDS_DELETE_SECONDS = 5  # ✅ requested
 
-# BTC: anti-spam + persistência
-btc_last_sent_ts = 0
+# Monthly snapshot file (MTD baseline)
+MONTHLY_FILE = Path(__file__).resolve().parent / "monthly_snapshot.json"
+
+# BTC anti-spam persistence
 BTC_LAST_FILE = Path(__file__).resolve().parent / "btc_last_sent.txt"
 
+
+# -------------------- STATE --------------------
+telegram_update_offset = None
+btc_last_sent_ts = 0
+
+# For /wallet inline menu cleanup
 # { user_id: {"cmd_msg_id": int, "menu_msg_id": int, "chat_id": str} }
-saldo_context: dict[int, dict] = {}
+wallet_context: dict[int, dict] = {}
 
 
-# -------------------- Helpers --------------------
+# -------------------- HELPERS --------------------
 def require_env():
     if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("Falta TELEGRAM_BOT_TOKEN")
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
 
 def fmt_usd(x) -> str:
     try:
@@ -55,7 +77,7 @@ def fmt_usd(x) -> str:
     except Exception:
         return "$-"
 
-def schedule_cleanup(chat_id: str, msg_ids: list[int], delay_seconds: int = AUTO_DELETE_SECONDS):
+def schedule_cleanup(chat_id: str, msg_ids: list[int], delay_seconds: int):
     def _do():
         for mid in msg_ids:
             telegram_delete_message(chat_id, mid)
@@ -78,7 +100,32 @@ def save_btc_last_sent(ts: int):
         pass
 
 
-# -------------------- Telegram --------------------
+# -------------------- MONTHLY SNAPSHOT --------------------
+def load_monthly_data() -> dict:
+    if MONTHLY_FILE.exists():
+        try:
+            return json.loads(MONTHLY_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+def save_monthly_data(data: dict):
+    try:
+        MONTHLY_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+def current_month_key() -> str:
+    return datetime.now().strftime("%Y-%m")
+
+def month_label(month_key: str) -> str:
+    try:
+        return datetime.strptime(month_key, "%Y-%m").strftime("%B %Y")
+    except Exception:
+        return month_key
+
+
+# -------------------- TELEGRAM (RAW API) --------------------
 def tg_get(method: str, params: dict | None = None, timeout=20):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     r = requests.get(url, params=params, timeout=timeout)
@@ -95,14 +142,15 @@ def telegram_send(chat_id: str, text: str, reply_markup: dict | None = None):
         payload["reply_markup"] = reply_markup
     data = tg_post("sendMessage", payload)
     if not data.get("ok"):
-        logger.error(f"sendMessage falhou: {data}")
+        logger.error(f"sendMessage failed: {data}")
         return False, data.get("description", str(data)), None
     return True, "", (data.get("result") or {}).get("message_id")
 
 def telegram_delete_message(chat_id: str, message_id: int):
     data = tg_post("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
     if not data.get("ok"):
-        logger.warning(f"deleteMessage falhou chat={chat_id} msg={message_id}: {data}")
+        # deleting can fail if too old / missing admin perms, etc.
+        logger.warning(f"deleteMessage failed chat={chat_id} msg={message_id}: {data}")
         return False
     return True
 
@@ -114,6 +162,7 @@ def telegram_answer_callback(callback_query_id: str, text: str = "", show_alert:
     })
 
 def telegram_delete_webhook_drop_pending():
+    # Avoid "webhook vs polling" conflicts
     logger.info(f"deleteWebhook: {tg_get('deleteWebhook', {'drop_pending_updates': 'true'})}")
 
 def telegram_get_updates(timeout=30):
@@ -131,10 +180,10 @@ def telegram_get_updates(timeout=30):
 
     if not data.get("ok"):
         if data.get("error_code") == 409:
-            logger.error("409 CONFLICT: outra instância do bot está a correr (getUpdates).")
+            logger.error("409 CONFLICT: another instance is polling getUpdates.")
             time.sleep(5)
             return []
-        logger.error(f"getUpdates falhou: {data}")
+        logger.error(f"getUpdates failed: {data}")
         return []
 
     updates = data.get("result", [])
@@ -142,17 +191,19 @@ def telegram_get_updates(timeout=30):
         telegram_update_offset = updates[-1]["update_id"] + 1
     return updates
 
-def kb_saldo_menu():
+
+# -------------------- UI (KEYBOARDS) --------------------
+def kb_wallet_menu():
     return {
         "inline_keyboard": [
-            [{"text": "📌 Posições abertas", "callback_data": "pos:open"}],
-            [{"text": "🟢 Capital livre", "callback_data": "cap:free"},
-             {"text": "🟠 Capital em trade (custo)", "callback_data": "cap:trade"}],
+            [{"text": "📌 Open Positions", "callback_data": "pos:open"}],
+            [{"text": "🟢 Free Balance", "callback_data": "cap:free"},
+             {"text": "🟠 In-Trade (Cost)", "callback_data": "cap:trade"}],
         ]
     }
 
 
-# -------------------- Bybit --------------------
+# -------------------- BYBIT CLIENT --------------------
 class BybitClient:
     def __init__(self, api_key: str, api_secret: str, base_url: str):
         self.api_key = api_key
@@ -175,6 +226,7 @@ class BybitClient:
         return r.json()
 
     def wallet_best(self):
+        # Try common account types
         last = None
         for acct in ["UNIFIED", "CONTRACT", "SPOT"]:
             data = self.sign_get("/v5/account/wallet-balance", {"accountType": acct, "coin": "USDT,USDC,BTC,ETH"})
@@ -182,11 +234,12 @@ class BybitClient:
                 lst = (data.get("result") or {}).get("list") or []
                 if lst:
                     return lst[0], None, acct
-                return None, "Resposta vazia", acct
+                return None, "Empty response", acct
             last = f"{data.get('retMsg')} (retCode={data.get('retCode')}, acct={acct})"
         return None, last, None
 
     def open_positions_all(self):
+        # Bybit v5 needs settleCoin or symbol; we try common settleCoins
         attempts = [("linear", "USDT"), ("linear", "USDC"), ("inverse", "BTC"), ("inverse", "USDT")]
         positions = []
         last_err = None
@@ -231,18 +284,42 @@ def get_client_for_user(user_id: int) -> BybitClient | None:
     return USERS.get(user_id)
 
 
-# -------------------- Métricas (robustas) --------------------
+# -------------------- MARKET PRICE (FOR /pnl POSITIONS) --------------------
+def bybit_get_ticker_price(symbol: str):
+    """
+    Fetch current price for symbol (prefer markPrice; fallback lastPrice).
+    Tries linear first (USDT/USDC perps), then inverse.
+    Returns: (price_float, "mark"/"last") or (None, None)
+    """
+    for category in ["linear", "inverse"]:
+        try:
+            url = f"{BYBIT_BASE_URL}/v5/market/tickers"
+            params = {"category": category, "symbol": symbol}
+            r = requests.get(url, params=params, timeout=10)
+            data = r.json()
+            if data.get("retCode") != 0:
+                continue
+
+            lst = (data.get("result") or {}).get("list") or []
+            if not lst:
+                continue
+
+            t = lst[0]
+            mark = t.get("markPrice")
+            last = t.get("lastPrice")
+
+            if mark and float(mark) > 0:
+                return float(mark), "mark"
+            if last and float(last) > 0:
+                return float(last), "last"
+        except Exception:
+            continue
+
+    return None, None
+
+
+# -------------------- METRICS --------------------
 def compute_trade_metrics(client: BybitClient):
-    """
-    Retorna métricas robustas para UTA/cross:
-      - wallet_balance: dinheiro base
-      - capital_free_real: wallet - (positionIM/initialMargin) - orderIM - maintenanceMargin
-      - assets_now: totalMarginBalance (ou totalEquity)
-      - available_margin: totalAvailableBalance (margem disponível)
-      - used: assets_now - available_margin
-      - pnl_open: soma UPL das posições
-      - capital_cost: assets_now - pnl_open (valor base antes da PnL)
-    """
     acc, err, acct = client.wallet_best()
     if err:
         return None, err
@@ -253,22 +330,20 @@ def compute_trade_metrics(client: BybitClient):
         except Exception:
             return 0.0
 
-    # base
     wallet_balance = f("totalWalletBalance")
     equity = f("totalEquity")
     margin_balance = f("totalMarginBalance")
     available_margin = f("totalAvailableBalance")
 
-    # margens (nem todas as contas devolvem todos os campos)
     position_im = f("totalPositionIM")
     initial_margin = f("totalInitialMargin")
     order_im = f("totalOrderIM")
     maintenance = f("totalMaintenanceMargin")
 
-    # fallback: se totalPositionIM vier 0, usa totalInitialMargin
     if position_im <= 0:
         position_im = initial_margin
 
+    # Bybit-reported asset figure
     assets_now = margin_balance if margin_balance > 0 else equity
 
     positions, perr = client.open_positions_all()
@@ -283,9 +358,11 @@ def compute_trade_metrics(client: BybitClient):
     used = max(0.0, assets_now - available_margin)
     capital_cost = assets_now - pnl_open
 
-    # ✅ Capital livre REAL (fora de trade)
     capital_free_real = wallet_balance - position_im - order_im - maintenance
-    capital_free_real = max(0.0, capital_free_real)  # nunca negativo
+    capital_free_real = max(0.0, capital_free_real)
+
+    # Reliable equity mark-to-market that includes open PnL
+    equity_mtm = wallet_balance + pnl_open
 
     return {
         "acct": acct,
@@ -295,16 +372,112 @@ def compute_trade_metrics(client: BybitClient):
         "used": used,
         "pnl_open": pnl_open,
         "capital_cost": capital_cost,
-        "position_im": position_im,
-        "order_im": order_im,
-        "maintenance": maintenance,
         "capital_free_real": capital_free_real,
+        "equity_mtm": equity_mtm,
         "positions": positions or [],
     }, None
 
 
-# -------------------- Bot funcs --------------------
-def fn_id(message: dict) -> str:
+# -------------------- MTD PNL (MONTH-TO-DATE) --------------------
+def compute_mtd_pnl_for_user(user_id: int):
+    """
+    Month-to-date profit% for the requesting user.
+    Baseline: start_wallet stored when month starts (first time bot sees new month).
+    Current: equity_mtm = wallet_balance + open_pnl (includes open trades).
+    """
+    client = get_client_for_user(user_id)
+    if not client:
+        return None, "No API configured for you."
+
+    m, err = compute_trade_metrics(client)
+    if err:
+        return None, f"Bybit: {err}"
+
+    month = current_month_key()
+    key = str(user_id)
+
+    data = load_monthly_data()
+    if key not in data:
+        data[key] = {}
+
+    # Migrate old key if needed
+    if data[key].get("month") == month and "start_wallet" not in data[key] and "start_equity" in data[key]:
+        data[key]["start_wallet"] = float(data[key]["start_equity"])
+        save_monthly_data(data)
+
+    # New month => snapshot baseline wallet
+    if data[key].get("month") != month:
+        data[key] = {"month": month, "start_wallet": float(m["wallet_balance"])}
+        save_monthly_data(data)
+
+    start_wallet = float(data[key].get("start_wallet", float(m["wallet_balance"])))
+    start_equity = start_wallet  # baseline (simple and matches your expectation)
+    now_equity = float(m["equity_mtm"])
+
+    pct = ((now_equity - start_equity) / start_equity * 100) if start_equity > 0 else 0.0
+
+    return {
+        "month": month,
+        "acct": m["acct"],
+        "start_equity": start_equity,
+        "now_wallet": float(m["wallet_balance"]),
+        "now_equity": now_equity,
+        "pnl_open": float(m["pnl_open"]),
+        "pct": pct,
+    }, None
+
+
+def fn_pnl(user_id: int) -> str:
+    r, err = compute_mtd_pnl_for_user(user_id)
+    if err:
+        return f"❌ {err}"
+
+    # ✅ Add open assets + live price
+    pos_lines = []
+    client = get_client_for_user(user_id)
+    if client:
+        m, merr = compute_trade_metrics(client)
+        if not merr:
+            positions = [p for p in (m["positions"] or []) if float(p.get("size") or 0) > 0]
+            for p in positions[:3]:  # keep it clean
+                sym = p.get("symbol") or "?"
+                price, src = bybit_get_ticker_price(sym)
+                if price is None:
+                    pos_lines.append(f"• <b>{sym}</b> — price: n/a")
+                else:
+                    pos_lines.append(f"• <b>{sym}</b> — price: <b>{price:,.4f}</b> <i>({src})</i>")
+            if len(positions) > 3:
+                pos_lines.append(f"<i>+{len(positions)-3} more…</i>")
+
+    title = month_label(r["month"])
+    emoji = "📈" if r["pct"] >= 0 else "📉"
+
+    positions_block = ""
+    if pos_lines:
+        positions_block = "\n\n<b>Open Assets</b>\n" + "\n".join(pos_lines)
+
+    return (
+        f"📊 <b>MTD PnL — {title}</b>\n\n"
+        f"👤 <b>{user_id}</b> <i>{r['acct']}</i>\n"
+        f"Start (baseline): {fmt_usd(r['start_equity'])}\n"
+        f"Open PnL: {fmt_usd(r['pnl_open'])}\n"
+        f"Now (equity): <b>{fmt_usd(r['now_equity'])}</b>\n"
+        f"Result: {emoji} <b>{r['pct']:+.2f}%</b>"
+        f"{positions_block}"
+    )
+
+
+# -------------------- BOT TEXT --------------------
+def fn_commands() -> str:
+    return (
+        "✨ <b>Quick Commands</b>\n\n"
+        "• <b>/wallet</b> — balances & positions menu\n"
+        "• <b>/pnl</b> — month-to-date PnL (includes open trades)\n"
+        "• <b>/ids</b> — show your user_id & chat_id\n"
+        "• <b>/commands</b> — show this list"
+    )
+
+def fn_ids(message: dict) -> str:
     chat = message.get("chat") or {}
     user = message.get("from") or {}
     username = user.get("username")
@@ -313,73 +486,71 @@ def fn_id(message: dict) -> str:
     return (
         "🆔 <b>IDs</b>\n"
         f"👤 user_id: <b>{user.get('id')}</b>\n"
-        f"👤 nome: <b>{name}</b> ({u})\n"
+        f"👤 name: <b>{name}</b> ({u})\n"
         f"💬 chat_id: <b>{chat.get('id')}</b>\n"
         f"💬 chat_type: <b>{chat.get('type')}</b>"
     )
 
-# ✅ AGORA: capital livre = capital fora de trade
-def fn_capital_livre(user_id: int) -> str:
+
+# -------------------- WALLET MENU FUNCTIONS --------------------
+def fn_free_balance(user_id: int) -> str:
     client = get_client_for_user(user_id)
     if not client:
-        return "⛔️ Não tens API configurada neste bot."
+        return "⛔️ No API configured for you."
 
     m, err = compute_trade_metrics(client)
     if err:
-        return f"❌ Bybit: {err}"
+        return f"❌ {err}"
 
-    # ✅ o que tu queres: dinheiro “livre para usar” (margem disponível)
     free_to_use = max(0.0, float(m["available_margin"]))
-
-    # info extra para explicar porque aparece “47”
     buffer_margin = max(0.0, float(m["capital_free_real"]))
 
     return (
-        f"🟢 <b>Capital livre</b> <i>{m['acct']}</i>\n"
-        f"Livre (para usar): <b>{fmt_usd(free_to_use)}</b>\n"
-        f"Buffer (margem sobrante): {fmt_usd(buffer_margin)}\n\n"
+        f"🟢 <b>Free Balance</b> <i>{m['acct']}</i>\n"
+        f"Available (to use): <b>{fmt_usd(free_to_use)}</b>\n"
+        f"Buffer (extra margin): {fmt_usd(buffer_margin)}\n\n"
         f"ℹ️ Wallet: {fmt_usd(m['wallet_balance'])}\n"
-        f"ℹ️ Assets (agora): {fmt_usd(m['assets_now'])}"
+        f"ℹ️ Assets (Bybit): {fmt_usd(m['assets_now'])}"
     )
 
-def fn_capital_em_trade_custo(user_id: int) -> str:
+def fn_in_trade_cost(user_id: int) -> str:
     client = get_client_for_user(user_id)
     if not client:
-        return "⛔️ Não tens API configurada neste bot."
+        return "⛔️ No API configured for you."
 
     m, err = compute_trade_metrics(client)
     if err:
-        return f"❌ Bybit: {err}"
+        return f"❌ {err}"
 
     return (
-        f"🟠 <b>Capital em trade (custo)</b> <i>{m['acct']}</i>\n"
-        f"Capital (custo): <b>{fmt_usd(m['capital_cost'])}</b>\n"
-        f"Assets (agora): {fmt_usd(m['assets_now'])}\n"
-        f"Margem disponível: {fmt_usd(m['available_margin'])}\n\n"
-        f"ℹ️ Em uso: {fmt_usd(m['used'])} | PnL aberta: {fmt_usd(m['pnl_open'])}"
+        f"🟠 <b>In-Trade (Cost)</b> <i>{m['acct']}</i>\n"
+        f"Cost basis: <b>{fmt_usd(m['capital_cost'])}</b>\n"
+        f"Now (equity mtm): {fmt_usd(m['equity_mtm'])}\n"
+        f"Available margin: {fmt_usd(m['available_margin'])}\n\n"
+        f"ℹ️ Used: {fmt_usd(m['used'])} | Open PnL: {fmt_usd(m['pnl_open'])}"
     )
 
-def fn_posicoes_abertas(user_id: int) -> str:
+def fn_open_positions(user_id: int) -> str:
     client = get_client_for_user(user_id)
     if not client:
-        return "⛔️ Não tens API configurada neste bot."
+        return "⛔️ No API configured for you."
 
     m, err = compute_trade_metrics(client)
     if err:
-        return f"❌ Bybit: {err}"
+        return f"❌ {err}"
 
     positions = [p for p in m["positions"] if float(p.get("size") or 0) > 0]
     if not positions:
-        return "📌 <b>Posições abertas</b>\n— nenhuma —"
+        return "📌 <b>Open Positions</b>\n— none —"
 
     lines = []
     for p in positions[:12]:
         lines.append(f"• <b>{p['symbol']}</b> {p['side']} | size: {p['size']} | UPL: {p['upl']}")
-    extra = f"\n<i>+{len(positions)-12} ocultas</i>" if len(positions) > 12 else ""
-    return "📌 <b>Posições abertas</b>\n" + "\n".join(lines) + extra
+    extra = f"\n<i>+{len(positions)-12} hidden</i>" if len(positions) > 12 else ""
+    return "📌 <b>Open Positions</b>\n" + "\n".join(lines) + extra
 
 
-# -------------------- BTC alert --------------------
+# -------------------- BTC ALERTS --------------------
 def get_btc_price():
     url = f"{BYBIT_BASE_URL}/v5/market/tickers"
     params = {"category": "linear"}
@@ -387,9 +558,9 @@ def get_btc_price():
     data = r.json()
     if data.get("retCode") != 0:
         return None
-    for ticker in data["result"]["list"]:
-        if ticker["symbol"] == "BTCUSDT":
-            return float(ticker["lastPrice"]), float(ticker.get("price24hPcnt", 0)) * 100
+    for t in (data.get("result") or {}).get("list") or []:
+        if t.get("symbol") == "BTCUSDT":
+            return float(t["lastPrice"]), float(t.get("price24hPcnt", 0)) * 100
     return None
 
 def send_btc_update(force: bool = False):
@@ -398,8 +569,6 @@ def send_btc_update(force: bool = False):
         return
 
     now_ts = int(time.time())
-
-    # Só respeita o cooldown quando NÃO é force
     if not force:
         if btc_last_sent_ts and (now_ts - btc_last_sent_ts) < BTC_ALERT_SECONDS:
             return
@@ -410,39 +579,48 @@ def send_btc_update(force: bool = False):
 
     price, change = got
     emoji = "📊"
-    if change > 5: emoji = "🚀"
-    elif change > 1: emoji = "📈"
-    elif change < -5: emoji = "📉"
-    elif change < 0: emoji = "🔻"
+    if change > 5:
+        emoji = "🚀"
+    elif change > 1:
+        emoji = "📈"
+    elif change < -5:
+        emoji = "📉"
+    elif change < 0:
+        emoji = "🔻"
 
     ok, err, _ = telegram_send(str(TELEGRAM_CHAT_ID), f"{emoji} <b>BTC</b> {fmt_usd(price)} ({change:+.2f}%)")
     if ok:
         btc_last_sent_ts = now_ts
         save_btc_last_sent(now_ts)
     else:
-        logger.error(f"BTC update falhou: {err}")
+        logger.error(f"BTC update failed: {err}")
 
-# -------------------- Main --------------------
+
+# -------------------- MAIN LOOP --------------------
 def main():
     require_env()
 
     global USERS
     USERS = load_users()
 
-    logger.info("🤖 Bot iniciado. Testnet=%s | Users=%s | CHAT_LIMIT=%s",
-                BYBIT_TESTNET, list(USERS.keys()), TELEGRAM_CHAT_ID or "(sem limite)")
+    logger.info("🤖 Bot started. Testnet=%s | Users=%s | CHAT_LIMIT=%s | BTC_ALERT_SECONDS=%s",
+                BYBIT_TESTNET, list(USERS.keys()), TELEGRAM_CHAT_ID or "(no limit)", BTC_ALERT_SECONDS)
 
     telegram_delete_webhook_drop_pending()
     load_btc_last_sent()
 
-    # ✅ manda logo 1 ao iniciar (e começa o timer a partir daqui)
-    send_btc_update(force=True)
+    # Send 1 BTC alert on startup (if TELEGRAM_CHAT_ID is set)
+    try:
+        send_btc_update(force=True)
+    except Exception as e:
+        logger.error(f"BTC startup error: {e}")
 
     while True:
         try:
             updates = telegram_get_updates(timeout=30)
 
             for upd in updates:
+                # ---------------- MESSAGE ----------------
                 if "message" in upd:
                     msg = upd["message"] or {}
                     chat = msg.get("chat") or {}
@@ -455,22 +633,47 @@ def main():
                     user_id = int(user.get("id", 0))
                     user_msg_id = int(msg.get("message_id", 0))
 
-                    if text_l.startswith("/id"):
-                        telegram_send(chat_id, fn_id(msg))
-                        continue
-
+                    # Chat limit (if set)
                     if TELEGRAM_CHAT_ID and chat_id != str(TELEGRAM_CHAT_ID):
                         continue
 
-                    if text_l.startswith("/saldo"):
+                    # /commands (and /comandos)
+                    if text_l.startswith("/commands") or text_l.startswith("/comandos"):
+                        ok, _, reply_id = telegram_send(chat_id, fn_commands())
+                        if ok and reply_id:
+                            schedule_cleanup(chat_id, [user_msg_id, reply_id], delay_seconds=COMMANDS_DELETE_SECONDS)
+                        continue
+
+                    # /ids (and /id) ✅ auto-delete 5s
+                    if text_l.startswith("/ids") or text_l.startswith("/id"):
+                        ok, _, reply_id = telegram_send(chat_id, fn_ids(msg))
+                        if ok and reply_id:
+                            schedule_cleanup(chat_id, [user_msg_id, reply_id], delay_seconds=IDS_DELETE_SECONDS)
+                        continue
+
+                    # /pnl (and /mensal) ✅ auto-delete 7s
+                    if text_l.startswith("/pnl") or text_l.startswith("/mensal"):
+                        ok, _, reply_id = telegram_send(chat_id, fn_pnl(user_id))
+                        if ok and reply_id:
+                            schedule_cleanup(chat_id, [user_msg_id, reply_id], delay_seconds=PNL_DELETE_SECONDS)
+                        continue
+
+                    # /wallet (and /saldo) => inline menu
+                    if text_l.startswith("/wallet") or text_l.startswith("/saldo"):
                         if not get_client_for_user(user_id):
-                            telegram_send(chat_id, "⛔️ Não tens API configurada neste bot.")
+                            telegram_send(chat_id, "⛔️ No API configured for you.")
                             continue
 
-                        ok, _, menu_msg_id = telegram_send(chat_id, "📍 <b>Saldo</b>\nEscolhe:", reply_markup=kb_saldo_menu())
+                        ok, _, menu_msg_id = telegram_send(chat_id, "💼 <b>Wallet</b>\nPick an option:", reply_markup=kb_wallet_menu())
                         if ok and menu_msg_id:
-                            saldo_context[user_id] = {"cmd_msg_id": user_msg_id, "menu_msg_id": menu_msg_id, "chat_id": chat_id}
+                            wallet_context[user_id] = {
+                                "cmd_msg_id": user_msg_id,
+                                "menu_msg_id": menu_msg_id,
+                                "chat_id": chat_id
+                            }
+                        continue
 
+                # ---------------- CALLBACK ----------------
                 if "callback_query" in upd:
                     cq = upd["callback_query"] or {}
                     cq_id = cq.get("id")
@@ -482,37 +685,39 @@ def main():
                     msg = cq.get("message") or {}
                     chat_id = str((msg.get("chat") or {}).get("id", ""))
 
+                    # Chat limit (if set)
                     if TELEGRAM_CHAT_ID and chat_id != str(TELEGRAM_CHAT_ID):
-                        telegram_answer_callback(cq_id, "Chat inválido.", show_alert=True)
+                        telegram_answer_callback(cq_id, "Invalid chat.", show_alert=True)
                         continue
 
                     if not get_client_for_user(user_id):
-                        telegram_send(chat_id, "⛔️ Não tens API configurada neste bot.")
+                        telegram_send(chat_id, "⛔️ No API configured for you.")
                         continue
 
                     if data == "pos:open":
-                        out = fn_posicoes_abertas(user_id)
+                        out = fn_open_positions(user_id)
                     elif data == "cap:free":
-                        out = fn_capital_livre(user_id)
+                        out = fn_free_balance(user_id)
                     elif data == "cap:trade":
-                        out = fn_capital_em_trade_custo(user_id)
+                        out = fn_in_trade_cost(user_id)
                     else:
-                        out = "Opção desconhecida."
+                        out = "Unknown option."
 
                     ok, _, reply_msg_id = telegram_send(chat_id, out)
-                    ctx = saldo_context.get(user_id)
+                    ctx = wallet_context.get(user_id)
                     if ok and reply_msg_id and ctx:
                         ids_to_delete = [ctx["cmd_msg_id"], ctx["menu_msg_id"], reply_msg_id]
                         schedule_cleanup(ctx["chat_id"], ids_to_delete, delay_seconds=AUTO_DELETE_SECONDS)
-                        saldo_context.pop(user_id, None)
+                        wallet_context.pop(user_id, None)
 
         except Exception as e:
-            logger.error(f"Erro no loop: {e}")
+            logger.error(f"Loop error: {e}")
 
+        # BTC periodic alert
         try:
-            send_btc_update()
+            send_btc_update(force=False)
         except Exception as e:
-            logger.error(f"Erro BTC: {e}")
+            logger.error(f"BTC error: {e}")
 
         time.sleep(1)
 
